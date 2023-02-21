@@ -1,7 +1,6 @@
 # @version 0.3.7
 
 from vyper.interfaces import ERC20
-from vyper.interfaces import ERC4626
 from vyper.interfaces import ERC20Detailed
 
 # INTERFACES #
@@ -60,10 +59,6 @@ event StrategyRevoked:
     strategy: indexed(address)
     loss: uint256
 
-event StrategyMigrated:
-    old_strategy: indexed(address)
-    new_strategy: indexed(address)
-
 event StrategyReported:
     strategy: indexed(address)
     gain: uint256
@@ -97,6 +92,9 @@ event UpdateDepositLimit:
 event UpdateMinimumTotalIdle:
     minimum_total_idle: uint256
 
+event UpdateProfitMaxUnlockTime:
+    profit_max_unlock_time: uint256
+
 event Shutdown:
     pass
 
@@ -115,6 +113,7 @@ struct StrategyParams:
 MAX_BPS: constant(uint256) = 10_000
 MAX_BPS_EXTENDED: constant(uint256) = 1_000_000_000_000
 PROTOCOL_FEE_ASSESSMENT_PERIOD: constant(uint256) = 24 * 3600 # assess once a day
+API_VERSION: constant(String[28]) = "0.1.0"
 
 # ENUMS #
 # Each permissioned function has its own Role.
@@ -123,6 +122,7 @@ PROTOCOL_FEE_ASSESSMENT_PERIOD: constant(uint256) = 24 * 3600 # assess once a da
 enum Roles:
     ADD_STRATEGY_MANAGER # can add strategies to the vault
     REVOKE_STRATEGY_MANAGER # can remove strategies from the vault
+    FORCE_REVOKE_MANAGER # can force revoke a strategy causing a loss
     ACCOUNTANT_MANAGER # can set the accountant that assesss fees
     QUEUE_MANAGER # can set the queue manager
     REPORTING_MANAGER # calls report for a strategy
@@ -133,17 +133,11 @@ enum Roles:
     PROFIT_UNLOCK_MANAGER # sets the profit_max_unlock_time
     SWEEPER # can sweep tokens from the vault
     EMERGENCY_MANAGER # can shutdown vault in an emergency
-    KEEPER
-    STRATEGY_MANAGER
 
 # IMMUTABLE #
 ASSET: immutable(ERC20)
 DECIMALS: immutable(uint256)
-PROFIT_MAX_UNLOCK_TIME: immutable(uint256)
 FACTORY: public(immutable(address))
-
-# CONSTANTS #
-API_VERSION: constant(String[28]) = "0.1.0"
 
 # STORAGE #
 # HashMap that records all the strategies that are allowed to receive assets from the vault
@@ -182,6 +176,7 @@ name: public(String[64])
 # ERC20 - symbol of the token
 symbol: public(String[32])
 
+profit_max_unlock_time: public(uint256)
 full_profit_unlock_date: public(uint256)
 profit_unlocking_rate: public(uint256)
 last_profit_update: uint256
@@ -202,8 +197,7 @@ def __init__(asset: ERC20, name: String[64], symbol: String[32], role_manager: a
 
     FACTORY = msg.sender
 
-    PROFIT_MAX_UNLOCK_TIME = profit_max_unlock_time
-
+    self.profit_max_unlock_time = profit_max_unlock_time
     self.name = name
     self.symbol = symbol
     self.last_report = block.timestamp
@@ -288,7 +282,7 @@ def _burn_shares(shares: uint256, owner: address):
 @internal
 def _unlocked_shares() -> uint256:
   # To avoid sudden price_per_share, shares are minted and insta-locked.
-  # Shares that have been locked are gradually unlocked over PROFIT_MAX_UNLOCK_TIME seconds
+  # Shares that have been locked are gradually unlocked over profit_max_unlock_time seconds
   _full_profit_unlock_date: uint256 = self.full_profit_unlock_date
   unlocked_shares: uint256 = 0
   if _full_profit_unlock_date > block.timestamp:
@@ -305,22 +299,19 @@ def _total_supply() -> uint256:
   return self.total_supply - self._unlocked_shares()
 
 @internal
-def _burn_unlocked_shares() -> uint256:
+def _burn_unlocked_shares():
   """
   Burns shares that have been unlocked since last update. In case the full unlocking period has passed, it stops the unlocking
   """
   unlocked_shares: uint256 = self._unlocked_shares()
   if unlocked_shares == 0:
-    return 0
+    return
   
   # update variables (done here to keep _unlocked_shares() as a view function)
   if self.full_profit_unlock_date > block.timestamp:
     self.last_profit_update = block.timestamp
-  else:
-    self.profit_unlocking_rate = 0
 
   self._burn_shares(unlocked_shares, self)
-  return unlocked_shares
 
 @view
 @internal
@@ -506,16 +497,16 @@ def _assess_share_of_unrealised_losses(strategy: address, assets_needed: uint256
 
 
 @internal
-def _redeem(sender: address, receiver: address, owner: address, shares_to_burn: uint256, _strategies: DynArray[address, 10] = []) -> uint256:
+def _redeem(sender: address, receiver: address, owner: address, shares_to_burn: uint256, strategies: DynArray[address, 10]) -> uint256:
     if sender != owner:
         self._spend_allowance(owner, sender, shares_to_burn)
 
-    strategies: DynArray[address, 10] = _strategies
+    _strategies: DynArray[address, 10] = strategies
 
     queue_manager: address = self.queue_manager
     if queue_manager != empty(address):
-        if len(_strategies) == 0 or (len(_strategies) != 0 and IQueueManager(queue_manager).should_override(self)):
-            strategies = IQueueManager(queue_manager).withdraw_queue(self)
+        if len(_strategies) == 0 or IQueueManager(queue_manager).should_override(self):
+            _strategies = IQueueManager(queue_manager).withdraw_queue(self)
 
     shares: uint256 = shares_to_burn
     shares_balance: uint256 = self.balance_of[owner]
@@ -542,7 +533,7 @@ def _redeem(sender: address, receiver: address, owner: address, shares_to_burn: 
 
         # NOTE: to compare against real withdrawals from strategies
         previous_balance: uint256 = ASSET.balanceOf(self)
-        for strategy in strategies:
+        for strategy in _strategies:
             assert self.strategies[strategy].activation != 0, "inactive strategy"
           
             # Starts with all the assets needed
@@ -624,7 +615,7 @@ def _add_strategy(new_strategy: address):
    log StrategyAdded(new_strategy)
 
 @internal
-def _revoke_strategy(old_strategy: address, force: bool):
+def _revoke_strategy(old_strategy: address, force: bool=False):
    assert self.strategies[old_strategy].activation != 0, "strategy not active"
    loss: uint256 = 0
 
@@ -696,7 +687,8 @@ def _update_debt(strategy: address, target_debt: uint256) -> uint256:
         post_balance: uint256 = ASSET.balanceOf(self)
         
         # making sure we are changing according to the real result no matter what. This will spend more gas but makes it more robust
-        assets_to_withdraw = post_balance - pre_balance
+        # also prevents issues from faulty strategy that either under or over delievers 'assets_to_withdraw'
+        assets_to_withdraw = min(post_balance - pre_balance, current_debt)
 
         self.total_idle += assets_to_withdraw
         self.total_debt -= assets_to_withdraw
@@ -775,7 +767,7 @@ def _process_report(strategy: address) -> (uint256, uint256):
     Different strategies might choose different reporting strategies: pessimistic, only realised P&L, ...
     The best way to report depends on the strategy
 
-    The profit will be distributed following a smooth curve over the next PROFIT_MAX_UNLOCK_TIME seconds. 
+    The profit will be distributed following a smooth curve over the next profit_max_unlock_time seconds. 
     Losses will be taken immediately, first from the profit buffer (avoiding an impact in pps), then will reduce pps
     """
     assert self.strategies[strategy].activation != 0, "inactive strategy"
@@ -875,9 +867,9 @@ def _process_report(strategy: address) -> (uint256, uint256):
 
     # Update unlocking rate and time to fully unlocked
     total_locked_shares: uint256 = previously_locked_shares + newly_locked_shares
-    _profit_max_unlock_time: uint256 = PROFIT_MAX_UNLOCK_TIME
+    _profit_max_unlock_time: uint256 = self.profit_max_unlock_time
     if total_locked_shares > 0 and _profit_max_unlock_time > 0:
-      # new_profit_locking_period is a weighted average between the remaining time of the previously locked shares and the PROFIT_MAX_UNLOCK_TIME
+      # new_profit_locking_period is a weighted average between the remaining time of the previously locked shares and the profit_max_unlock_time
       new_profit_locking_period: uint256 = (previously_locked_shares * remaining_time + newly_locked_shares * _profit_max_unlock_time) / total_locked_shares
       self.profit_unlocking_rate = total_locked_shares * MAX_BPS_EXTENDED / new_profit_locking_period
       self.full_profit_unlock_date = block.timestamp + new_profit_locking_period
@@ -909,7 +901,7 @@ def set_accountant(new_accountant: address):
 
 @external
 def set_queue_manager(new_queue_manager: address):
-    self._enforce_role(msg.sender, Roles.ACCOUNTING_MANAGER)
+    self._enforce_role(msg.sender, Roles.QUEUE_MANAGER)
     self.queue_manager = new_queue_manager
     log UpdateQueueManager(new_queue_manager)
 
@@ -924,6 +916,14 @@ def set_minimum_total_idle(minimum_total_idle: uint256):
     self._enforce_role(msg.sender, Roles.MINIMUM_IDLE_MANAGER)
     self.minimum_total_idle = minimum_total_idle
     log UpdateMinimumTotalIdle(minimum_total_idle)
+
+@external
+def set_profit_max_unlock_time(new_profit_max_unlock_time: uint256):
+    # no need to update locking period as the current period will use the old rate
+    # and on the next report it will be reset with the new unlocking time
+    self._enforce_role(msg.sender, Roles.PROFIT_UNLOCK_MANAGER)
+    self.profit_max_unlock_time = new_profit_max_unlock_time
+    log UpdateProfitMaxUnlockTime(new_profit_max_unlock_time)
 
 # ROLE MANAGEMENT #
 @internal
@@ -986,6 +986,7 @@ def process_report(strategy: address) -> (uint256, uint256):
 def sweep(token: address) -> (uint256):
     self._enforce_role(msg.sender, Roles.SWEEPER)
     assert token != self, "can't sweep self"
+    assert self.strategies[token].activation == 0, "can't sweep strategy"
     amount: uint256 = 0
     if token == ASSET.address:
         amount = ASSET.balanceOf(self) - self.total_idle
@@ -1013,9 +1014,10 @@ def force_revoke_strategy(old_strategy: address):
     The vault will remove the inputed strategy and write off any debt left in it as loss. 
     This function is a dangerous function as it can force a strategy to take a loss. 
     All possible assets should be removed from the strategy first via update_debt
-    Note that if a strategy is removed erroneously it can be readded and the loss will be credited as profit. Fees will apply
+    Note that if a strategy is removed erroneously it can be re-added and the loss will be credited as profit. Fees will apply
     """
-    self._enforce_role(msg.sender, Roles.STRATEGY_MANAGER)
+    self._enforce_role(msg.sender, Roles.FORCE_REVOKE_MANAGER)
+
     self._revoke_strategy(old_strategy, True)
 
 ## DEBT MANAGEMENT ##
