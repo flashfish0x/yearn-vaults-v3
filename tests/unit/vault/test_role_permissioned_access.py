@@ -40,6 +40,7 @@ def test_force_revoke_strategy__revoke_strategy_role_closed__reverts(
 
     vault.add_strategy(new_strategy, sender=gov)
     with ape.reverts("not allowed"):
+
         vault.force_revoke_strategy(new_strategy, sender=bunny)
 
 
@@ -476,3 +477,4 @@ def test_set_queue_manager__queue_manager_open_then_close__reverts(
 
     with ape.reverts("not allowed"):
         vault.set_queue_manager(fish, sender=fish)
+

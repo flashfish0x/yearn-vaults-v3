@@ -41,9 +41,9 @@ def test_revoke_strategy__revoke_strategy_manager(vault, strategy, gov, bunny):
 def test_force_revoke_strategy__no_revoke_strategy_manager__reverts(
     vault, strategy, create_strategy, bunny
 ):
-
     with ape.reverts("not allowed"):
         vault.force_revoke_strategy(strategy, sender=bunny)
+
 
 
 def test_force_revoke_strategy__revoke_strategy_manager(
@@ -199,6 +199,7 @@ def test_shutdown_vault__emergency_manager(gov, vault, bunny):
     assert vault.roles(bunny) == 4160
 
 
+
 # REPORTING_MANAGER
 
 
@@ -286,3 +287,4 @@ def test_set_profit_unlcok__profit_unlcok_manager(gov, vault, bunny):
     assert vault.profit_max_unlock_time() != time
     vault.set_profit_max_unlock_time(time, sender=bunny)
     assert vault.profit_max_unlock_time() == time
+

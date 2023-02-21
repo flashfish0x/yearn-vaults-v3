@@ -977,6 +977,7 @@ def available_deposit_limit() -> uint256:
 
 ## REPORTING MANAGEMENT ##
 @external
+@nonreentrant("lock")
 def process_report(strategy: address) -> (uint256, uint256):
     self._enforce_role(msg.sender, Roles.REPORTING_MANAGER)
     return self._process_report(strategy)
@@ -1016,6 +1017,7 @@ def force_revoke_strategy(old_strategy: address):
     Note that if a strategy is removed erroneously it can be re-added and the loss will be credited as profit. Fees will apply
     """
     self._enforce_role(msg.sender, Roles.FORCE_REVOKE_MANAGER)
+
     self._revoke_strategy(old_strategy, True)
 
 ## DEBT MANAGEMENT ##
